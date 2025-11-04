@@ -88,9 +88,10 @@ class Block(nn.Module):
         return x
 
 class Transformer(nn.Module):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, *, tie_weights: bool = True):
         super().__init__()
         self.config = config
+        self.tie_weights = tie_weights
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
@@ -101,7 +102,8 @@ class Transformer(nn.Module):
             )
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight  # weight tying
+        if tie_weights:
+            self.transformer.wte.weight = self.lm_head.weight  # weight tying
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -128,4 +130,3 @@ class Transformer(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         return logits, loss
-

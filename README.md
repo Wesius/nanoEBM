@@ -98,6 +98,9 @@ uv run python train.py \
   model.langevin_step_size=0.01 \
   model.langevin_noise_scale=0.005
 
+# Baseline transformer (no energy head / thinking)
+uv run python train.py train.mode=lm
+
 # Basic contrastive divergence test
 uv run python train.py \
   model.use_contrastive=true \

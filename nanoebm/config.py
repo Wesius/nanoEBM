@@ -54,6 +54,7 @@ class DataConfig:
 @chz.chz
 class TrainConfig:
     """Training hyperparameters"""
+    mode: str = "ebm"  # 'ebm' or 'lm'
     # Optimization
     learning_rate: float = 3e-4
     beta1: float = 0.9

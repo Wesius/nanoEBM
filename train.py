@@ -16,6 +16,7 @@ import chz
 import torch
 from nanoebm.config import Config
 from nanoebm.model import EBM
+from nanoebm.lm import AutoregressiveLM
 from nanoebm.data import get_loader
 from nanoebm.contrastive import create_contrastive_loss
 from nanoebm.utils import (
@@ -71,21 +72,36 @@ def main(cfg: Config):
     model_cfg = chz.replace(cfg.model, vocab_size=vocab_size)
     logger.info(f"Loaded dataset: {cfg.data.dataset} | vocab_size={vocab_size}")
 
+    # Select training mode
+    mode = getattr(cfg.train, "mode", "ebm").lower()
+    if mode not in {"ebm", "lm", "gpt", "transformer"}:
+        raise ValueError(f"Unknown training mode: {mode}")
+    is_ebm = mode == "ebm"
+    if mode in {"gpt", "transformer"}:
+        mode = "lm"
+
+    logger.info(f"Training mode: {mode}")
+
     # Initialize the model
-    model = EBM(model_cfg).to(device)
+    if is_ebm:
+        model = EBM(model_cfg).to(device)
+    else:
+        model = AutoregressiveLM(model_cfg).to(device)
     param_count = count_parameters(model)
+    logger.info(f"Model parameters: {param_count:,}")
 
     flop_stats = None
     measurement_contrastive = None
     try:
-        measurement_contrastive = create_contrastive_loss(model, model_cfg) if model_cfg.use_contrastive else None
+        if is_ebm and model_cfg.use_contrastive:
+            measurement_contrastive = create_contrastive_loss(model, model_cfg)
         flop_stats = estimate_training_flops(
             model,
             batch_size=cfg.data.batch_size,
             block_size=cfg.data.block_size,
             warmup_steps=cfg.model.warmup_steps_no_refine,
             total_steps=cfg.train.max_steps,
-            device=model.alpha.device,
+            device=next(model.parameters()).device if any(p.requires_grad for p in model.parameters()) else torch.device("cpu"),
             contrastive_loss_fn=measurement_contrastive,
         )
         if flop_stats:
@@ -111,10 +127,10 @@ def main(cfg: Config):
         model = torch.compile(model)
     
     # Initialize contrastive loss if enabled
-    contrastive_loss_fn = create_contrastive_loss(model, model_cfg)
-    if contrastive_loss_fn is not None:
+    contrastive_loss_fn = None
+    if is_ebm and model_cfg.use_contrastive:
+        contrastive_loss_fn = create_contrastive_loss(model, model_cfg)
         logger.info(f"Contrastive training enabled: type={model_cfg.contrastive_type}, k={model_cfg.contrastive_k}, weight={model_cfg.contrastive_weight}")
-    logger.info(f"Model parameters: {param_count:,}")
 
     # Initialize the optimizer with separate learning rates for alpha (refine step size)
     base_lr = cfg.train.learning_rate
@@ -177,12 +193,15 @@ def main(cfg: Config):
     print("\n" + "="*60)
     print("Training Configuration")
     print("="*60)
+    print(f"Mode:            {mode.upper():>6s}")
     print(f"Steps:           {start_step:>6d} → {cfg.train.max_steps:>6d}")
     print(f"LR warmup:       {cfg.train.warmup_iters:>6d} steps")
-    print(f"System 2 warmup: {cfg.model.warmup_steps_no_refine:>6d} steps (System 1 only)")
+    if is_ebm:
+        print(f"System 2 warmup: {cfg.model.warmup_steps_no_refine:>6d} steps (System 1 only)")
     print(f"Learning rate:   {cfg.train.learning_rate:>10.2e} (base)")
-    print(f"Alpha (step):    {cfg.model.alpha_value:>10.3f} (fixed)")
-    print(f"Refine steps:    {cfg.model.refine_steps:>6d}")
+    if is_ebm:
+        print(f"Alpha (step):    {cfg.model.alpha_value:>10.3f} (fixed)")
+        print(f"Refine steps:    {cfg.model.refine_steps:>6d}")
     print(f"Batch size:      {cfg.data.batch_size:>6d}")
     print(f"Block size:      {cfg.data.block_size:>6d}")
     print(f"Vocab size:      {vocab_size:>6d}")
@@ -191,8 +210,11 @@ def main(cfg: Config):
         warmup = flop_stats["per_step_warmup"]
         refine = flop_stats["per_step_refine"]
         total = flop_stats["total"]
-        print(f"FLOPs/step S1:   {warmup:>12,d} ({warmup / 1e9:,.2f} GF)")
-        print(f"FLOPs/step S2:   {refine:>12,d} ({refine / 1e9:,.2f} GF)")
+        if is_ebm:
+            print(f"FLOPs/step S1:   {warmup:>12,d} ({warmup / 1e9:,.2f} GF)")
+            print(f"FLOPs/step S2:   {refine:>12,d} ({refine / 1e9:,.2f} GF)")
+        else:
+            print(f"FLOPs/step:      {refine:>12,d} ({refine / 1e9:,.2f} GF)")
         print(f"Total FLOPs:     {total:>12,d} ({total / 1e12:,.2f} TF)")
     if model_cfg.use_contrastive:
         print(f"Contrastive:     {model_cfg.contrastive_type:>6s} (k={model_cfg.contrastive_k}, weight={model_cfg.contrastive_weight:.2f})")
@@ -212,15 +234,17 @@ def main(cfg: Config):
         ("loss", "loss", ".3f", 8),
         ("ppl", "perplexity", ".3f", 7),
         ("lr", "lr", ".2e", 11),
-        ("alpha", "alpha", ".3f", 8),  # gradient descent step size
-        ("Egap", "energy_gap", ".4f", 10),  # E0 - EK (improvement from thinking)
-        ("E0", "initial_energy", ".4f", 10),  # System 1 energy
-        ("EK", "final_energy", ".4f", 10),  # System 2 energy (after grad descent)
     ]
-    
-    # Add contrastive loss column if enabled
-    if model_cfg.use_contrastive:
-        table_cols.append(("CD", "cd_loss", ".4f", 8))
+
+    if is_ebm:
+        table_cols.extend([
+            ("alpha", "alpha", ".3f", 8),
+            ("Egap", "energy_gap", ".4f", 10),
+            ("E0", "initial_energy", ".4f", 10),
+            ("EK", "final_energy", ".4f", 10),
+        ])
+        if model_cfg.use_contrastive:
+            table_cols.append(("CD", "cd_loss", ".4f", 8))
     
     if flop_stats:
         table_cols.extend([
@@ -288,7 +312,7 @@ def main(cfg: Config):
         x, y = x.to(device), y.to(device)
         with timed("forward", metrics):
             # Use System 2 only after warmup period
-            use_refine = step >= cfg.model.warmup_steps_no_refine
+            use_refine = is_ebm and step >= cfg.model.warmup_steps_no_refine
             
             # Use contrastive loss if enabled
             if contrastive_loss_fn is not None:
@@ -321,7 +345,8 @@ def main(cfg: Config):
             if k in extras:
                 metrics[k] = extras[k]
         # Track current alpha (step size - now fixed)
-        metrics["alpha"] = float(model.alpha.item())
+        if is_ebm and hasattr(model, "alpha"):
+            metrics["alpha"] = float(model.alpha.item())
 
         if flop_stats:
             step_flops = refine_step_flops if step >= warmup_flop_steps else warmup_step_flops
