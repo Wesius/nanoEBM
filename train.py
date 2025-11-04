@@ -25,6 +25,8 @@ from nanoebm.utils import (
     load_checkpoint,
     timed,
     get_lr,
+    count_parameters,
+    estimate_training_flops,
 )
 
 
@@ -71,6 +73,40 @@ def main(cfg: Config):
 
     # Initialize the model
     model = EBM(model_cfg).to(device)
+    param_count = count_parameters(model)
+
+    flop_stats = None
+    measurement_contrastive = None
+    try:
+        measurement_contrastive = create_contrastive_loss(model, model_cfg) if model_cfg.use_contrastive else None
+        flop_stats = estimate_training_flops(
+            model,
+            batch_size=cfg.data.batch_size,
+            block_size=cfg.data.block_size,
+            warmup_steps=cfg.model.warmup_steps_no_refine,
+            total_steps=cfg.train.max_steps,
+            device=model.alpha.device,
+            contrastive_loss_fn=measurement_contrastive,
+        )
+        if flop_stats:
+            warmup_gflops = flop_stats["per_step_warmup"] / 1e9
+            refine_gflops = flop_stats["per_step_refine"] / 1e9
+            total_tflops = flop_stats["total"] / 1e12
+            logger.info(
+                "Estimated FLOPs - warmup: "
+                f"{flop_stats['per_step_warmup']:,} ({warmup_gflops:.2f} GF/step), "
+                f"refine: {flop_stats['per_step_refine']:,} ({refine_gflops:.2f} GF/step), "
+                f"total: {flop_stats['total']:,} ({total_tflops:.2f} TF)"
+            )
+    except Exception as e:
+        logger.warning(f"Failed to estimate training FLOPs: {e}")
+    finally:
+        measurement_contrastive = None
+
+    warmup_step_flops = flop_stats["per_step_warmup"] if flop_stats else 0
+    refine_step_flops = flop_stats["per_step_refine"] if flop_stats else 0
+    warmup_flop_steps = flop_stats["warmup_steps"] if flop_stats else 0
+
     if cfg.train.compile:
         model = torch.compile(model)
     
@@ -78,6 +114,7 @@ def main(cfg: Config):
     contrastive_loss_fn = create_contrastive_loss(model, model_cfg)
     if contrastive_loss_fn is not None:
         logger.info(f"Contrastive training enabled: type={model_cfg.contrastive_type}, k={model_cfg.contrastive_k}, weight={model_cfg.contrastive_weight}")
+    logger.info(f"Model parameters: {param_count:,}")
 
     # Initialize the optimizer with separate learning rates for alpha (refine step size)
     base_lr = cfg.train.learning_rate
@@ -130,6 +167,12 @@ def main(cfg: Config):
     model.train()
     logger.info(f"Training from step {start_step} to {cfg.train.max_steps}")
 
+    flop_cumulative = 0
+    if flop_stats:
+        warmup_completed = min(start_step, warmup_flop_steps)
+        refine_completed = max(0, start_step - warmup_flop_steps)
+        flop_cumulative = warmup_completed * warmup_step_flops + refine_completed * refine_step_flops
+
     # Print initial training configuration
     print("\n" + "="*60)
     print("Training Configuration")
@@ -143,6 +186,14 @@ def main(cfg: Config):
     print(f"Batch size:      {cfg.data.batch_size:>6d}")
     print(f"Block size:      {cfg.data.block_size:>6d}")
     print(f"Vocab size:      {vocab_size:>6d}")
+    print(f"Parameters:      {param_count:>12,d} ({param_count / 1e6:,.2f}M)")
+    if flop_stats:
+        warmup = flop_stats["per_step_warmup"]
+        refine = flop_stats["per_step_refine"]
+        total = flop_stats["total"]
+        print(f"FLOPs/step S1:   {warmup:>12,d} ({warmup / 1e9:,.2f} GF)")
+        print(f"FLOPs/step S2:   {refine:>12,d} ({refine / 1e9:,.2f} GF)")
+        print(f"Total FLOPs:     {total:>12,d} ({total / 1e12:,.2f} TF)")
     if model_cfg.use_contrastive:
         print(f"Contrastive:     {model_cfg.contrastive_type:>6s} (k={model_cfg.contrastive_k}, weight={model_cfg.contrastive_weight:.2f})")
     print("="*60 + "\n")
@@ -171,6 +222,12 @@ def main(cfg: Config):
     if model_cfg.use_contrastive:
         table_cols.append(("CD", "cd_loss", ".4f", 8))
     
+    if flop_stats:
+        table_cols.extend([
+            ("GFstep", "flops_step_gf", ".1f", 8),
+            ("TFtot", "flops_total_tf", ".2f", 8),
+        ])
+
     table_cols.extend([
         ("t/fwd", "time/forward", ".3f", 8),
         ("t/bwd", "time/backward", ".3f", 8),
@@ -265,6 +322,14 @@ def main(cfg: Config):
                 metrics[k] = extras[k]
         # Track current alpha (step size - now fixed)
         metrics["alpha"] = float(model.alpha.item())
+
+        if flop_stats:
+            step_flops = refine_step_flops if step >= warmup_flop_steps else warmup_step_flops
+            flop_cumulative += step_flops
+            metrics["flops_step"] = step_flops
+            metrics["flops_total"] = flop_cumulative
+            metrics["flops_step_gf"] = step_flops / 1e9
+            metrics["flops_total_tf"] = flop_cumulative / 1e12
 
         if step % cfg.train.log_interval == 0:
             # Persist metrics

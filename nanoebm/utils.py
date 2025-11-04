@@ -13,6 +13,11 @@ import chz
 import torch
 import torch.nn as nn
 
+# Optional FLOP counter (torch>=2.1)
+try:  # pragma: no cover - optional dependency
+    from torch.utils.flop_counter import FlopCounterMode  # type: ignore
+except ImportError:  # pragma: no cover
+    FlopCounterMode = None  # type: ignore
 
 # ============================================================================
 # Logging
@@ -217,6 +222,153 @@ def get_lr(step: int, warmup_iters: int, lr_decay_iters: int, learning_rate: flo
     import math as _m
     coeff = 0.5 * (1.0 + _m.cos(decay_ratio * _m.pi))
     return float(min_lr + coeff * (learning_rate - min_lr))
+
+
+# ============================================================================
+# Parameter utilities
+# ============================================================================
+
+def count_parameters(model: nn.Module, require_grad_only: bool = True) -> int:
+    """
+    Count the number of parameters in a model.
+
+    Args:
+        model: Module to inspect.
+        require_grad_only: If True (default), only count trainable parameters.
+
+    Returns:
+        Total number of parameters matching the filter.
+    """
+    parameters = (
+        p.numel()
+        for p in model.parameters()
+        if not require_grad_only or p.requires_grad
+    )
+    return int(sum(parameters))
+
+
+# ============================================================================
+# FLOP utilities
+# ============================================================================
+
+def measure_step_flops(
+    model: nn.Module,
+    *,
+    batch_size: int,
+    block_size: int,
+    device: torch.device,
+    use_refine: bool,
+    include_backward: bool = True,
+    contrastive_loss_fn: Optional[Any] = None,
+) -> Optional[int]:
+    """
+    Measure FLOPs for a single training step (forward/backward).
+
+    Args:
+        model: The EBM model under test.
+        batch_size: Synthetic batch size to emulate.
+        block_size: Sequence length.
+        device: Device for synthetic inputs.
+        use_refine: Whether to enable System 2 refinement (matches training schedule).
+        include_backward: Include backward pass FLOPs.
+        contrastive_loss_fn: Optional contrastive loss callable mirroring training.
+
+    Returns:
+        Total FLOPs for the measured step, or None if unsupported.
+    """
+    if FlopCounterMode is None:
+        return None
+
+    # Keep original mode and enable training behaviour (dropout, etc.)
+    was_training = model.training
+    model.train()
+
+    vocab_size = getattr(model.config, "vocab_size")
+    x = torch.randint(0, vocab_size, (batch_size, block_size), device=device)
+    y = torch.randint(0, vocab_size, (batch_size, block_size), device=device)
+
+    with FlopCounterMode(display=False) as counter:
+        if contrastive_loss_fn is not None:
+            loss, _, _ = model.forward_with_contrastive(
+                x,
+                targets=y,
+                use_refine=use_refine,
+                refine_steps=model.config.refine_steps,
+                contrastive_loss_fn=contrastive_loss_fn,
+            )
+        else:
+            loss, _, _ = model(
+                x,
+                targets=y,
+                use_refine=use_refine,
+                refine_steps=model.config.refine_steps,
+            )
+
+        if include_backward and loss is not None:
+            loss.backward()
+
+    total_flops = counter.get_total_flops()
+    model.zero_grad(set_to_none=True)
+
+    if not was_training:
+        model.eval()
+
+    return int(total_flops)
+
+
+def estimate_training_flops(
+    model: nn.Module,
+    *,
+    batch_size: int,
+    block_size: int,
+    warmup_steps: int,
+    total_steps: int,
+    device: torch.device,
+    contrastive_loss_fn: Optional[Any] = None,
+) -> Optional[Dict[str, int]]:
+    """
+    Estimate total FLOPs for the configured training run.
+
+    Returns:
+        Dict with per-step and total FLOPs, or None if unsupported.
+    """
+    if FlopCounterMode is None:
+        return None
+
+    warmup = max(0, min(int(warmup_steps), int(total_steps)))
+    refine = max(int(total_steps) - warmup, 0)
+
+    warmup_flops = measure_step_flops(
+        model,
+        batch_size=batch_size,
+        block_size=block_size,
+        device=device,
+        use_refine=False,
+        include_backward=True,
+        contrastive_loss_fn=contrastive_loss_fn,
+    )
+
+    refine_flops = measure_step_flops(
+        model,
+        batch_size=batch_size,
+        block_size=block_size,
+        device=device,
+        use_refine=True,
+        include_backward=True,
+        contrastive_loss_fn=contrastive_loss_fn,
+    )
+
+    if warmup_flops is None or refine_flops is None:
+        return None
+
+    total = warmup * warmup_flops + refine * refine_flops
+    return {
+        "warmup_steps": warmup,
+        "refine_steps": refine,
+        "per_step_warmup": warmup_flops,
+        "per_step_refine": refine_flops,
+        "total": total,
+    }
 
 
 # ============================================================================
